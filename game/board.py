@@ -269,15 +269,8 @@ class Board:
         if obj is None or self.grid[to_y][to_x] is not None:
             return False
             
-        # Verify move is valid according to movement type
-        dx = abs(to_x - from_x)
-        dy = abs(to_y - from_y)
-        if self.movement_type == MovementType.CARDINAL:
-            if dx + dy != 1:  # Only allow one step in cardinal directions
-                return False
-        else:  # DIAGONAL
-            if dx > 1 or dy > 1 or (dx + dy) == 0:  # Allow one step in any direction
-                return False
+        # Movement validation is now handled by the unit's movement system
+        # The board just checks if the destination is valid and empty
         
         self.grid[to_y][to_x] = obj
         self.grid[from_y][from_x] = None

@@ -269,7 +269,7 @@ class Unit:
         # Unit should not move if energy is less than or equal to the cost,
         # meaning the move would leave it with 0 or negative energy.
         # The test `test_movement_mechanics` expects this behavior.
-        if self.energy < current_move_cost: # Modified from < to <=
+        if self.energy <= current_move_cost:
             return False
             
         # Check if movement is possible
@@ -296,33 +296,17 @@ class Unit:
         if not self.alive:
             return []
 
-        # Adjust vision range based on state
-        vision_range = self.vision
-        if self.state == "hunting":
-            vision_range = int(self.vision * 1.5)
-        elif self.state == "fleeing":
-            vision_range = int(self.vision * 1.2)
-        
         # Apply energy cost for looking if it's greater than 0
         if self.energy_cost_look > 0:
             if self.energy < self.energy_cost_look:
                 return [] # Not enough energy to look
             self.energy -= self.energy_cost_look
-
-        visible_objects = []
-        for y in range(self.y - vision_range, self.y + vision_range + 1):
-            for x in range(self.x - vision_range, self.x + vision_range + 1):
-                if board.is_valid_position(x, y):
-                    obj = board.get_object(x, y)
-                    if obj is not None and obj is not self:
-                        # Calculate distance for priority assessment
-                        distance = abs(x - self.x) + abs(y - self.y)
-                        if distance <= vision_range:
-                            visible_objects.append((obj, x, y, distance))
         
-        # Sort by distance for easier priority assessment
+        # Use the centralized movement system to get visible objects
+        _, visible_objects = self.get_movement_options(board)
+        
         # Convert to expected format (obj, x, y) without distance
-        return [(obj, x, y) for obj, x, y, _ in sorted(visible_objects, key=lambda x: x[3])]
+        return [(obj, x, y) for obj, x, y, _ in visible_objects]
     
     def eat(self, food):
         """
@@ -555,3 +539,197 @@ class Unit:
                 return (alt_x, alt_y)
                 
         return None
+    
+    def get_movement_options(self, board):
+        """
+        Get all possible moves and visible objects within vision range.
+        This centralized method handles edge detection and movement validation.
+        
+        Args:
+            board (Board): The game board.
+            
+        Returns:
+            tuple: (possible_moves, visible_objects)
+                - possible_moves: List of (x, y, score) tuples for valid moves
+                - visible_objects: List of (obj, x, y, distance) tuples for objects in vision
+        """
+        if not self.alive or self.state in ["dead", "decaying", "resting", "feeding"]:
+            return [], []
+            
+        # Get all objects within vision range
+        visible_objects = []
+        vision_range = self.vision
+        
+        # Adjust vision based on state
+        if self.state == "hunting":
+            vision_range = int(self.vision * 1.5)
+        elif self.state == "fleeing":
+            vision_range = int(self.vision * 1.2)
+            
+        # Scan the area within vision range
+        for dy in range(-vision_range, vision_range + 1):
+            for dx in range(-vision_range, vision_range + 1):
+                check_x = self.x + dx
+                check_y = self.y + dy
+                
+                # Skip invalid positions
+                if not board.is_valid_position(check_x, check_y):
+                    continue
+                    
+                # Calculate Manhattan distance
+                distance = abs(dx) + abs(dy)
+                if distance > vision_range:
+                    continue
+                    
+                # Check for objects at this position
+                obj = board.get_object(check_x, check_y)
+                if obj is not None and obj is not self:
+                    visible_objects.append((obj, check_x, check_y, distance))
+        
+        # Get possible moves based on speed
+        possible_moves = []
+        for dy in range(-self.speed, self.speed + 1):
+            for dx in range(-self.speed, self.speed + 1):
+                # Skip if movement exceeds speed limit (Manhattan distance)
+                if abs(dx) + abs(dy) > self.speed:
+                    continue
+                    
+                # Skip no movement
+                if dx == 0 and dy == 0:
+                    continue
+                    
+                new_x = self.x + dx
+                new_y = self.y + dy
+                
+                # Check if position is valid and empty
+                if board.is_valid_position(new_x, new_y) and board.get_object(new_x, new_y) is None:
+                    # Calculate base score for the move
+                    score = self._calculate_move_score(new_x, new_y, visible_objects, board)
+                    possible_moves.append((new_x, new_y, score))
+        
+        # Sort moves by score (highest first)
+        possible_moves.sort(key=lambda m: m[2], reverse=True)
+        
+        return possible_moves, visible_objects
+    
+    def _calculate_move_score(self, target_x, target_y, visible_objects, board):
+        """
+        Calculate a score for a potential move based on various factors.
+        This base implementation provides general scoring that can be overridden.
+        
+        Args:
+            target_x (int): Target x position
+            target_y (int): Target y position
+            visible_objects (list): List of visible objects from get_movement_options
+            board (Board): The game board
+            
+        Returns:
+            float: Score for the move (higher is better)
+        """
+        score = 0.0
+        
+        # Strong penalty for board edges to prevent getting stuck
+        edge_penalty = 0
+        if target_x == 0 or target_x == board.width - 1:
+            edge_penalty += 3
+        if target_y == 0 or target_y == board.height - 1:
+            edge_penalty += 3
+        # Extra penalty for corners
+        if edge_penalty >= 6:
+            edge_penalty += 4
+        score -= edge_penalty
+        
+        # Strong bonus for escaping edges/corners
+        currently_at_edge = (self.x == 0 or self.x == board.width - 1 or 
+                            self.y == 0 or self.y == board.height - 1)
+        if currently_at_edge:
+            # Calculate how much we're moving away from edges
+            current_edge_distance = min(self.x, board.width - 1 - self.x, 
+                                      self.y, board.height - 1 - self.y)
+            target_edge_distance = min(target_x, board.width - 1 - target_x,
+                                     target_y, board.height - 1 - target_y)
+            
+            if target_edge_distance > current_edge_distance:
+                score += 15  # Strong bonus for moving away from edge
+            elif target_edge_distance == current_edge_distance:
+                score += 5   # Small bonus for lateral movement along edge
+        
+        # Basic exploration bonus - prefer moving in the exploration direction
+        if hasattr(self, 'exploration_direction'):
+            if (target_x - self.x) == self.exploration_direction[0] and \
+               (target_y - self.y) == self.exploration_direction[1]:
+                score += 2
+        
+        # State-specific scoring
+        if self.state == "fleeing":
+            # When fleeing, prioritize distance from threats
+            threat_found = False
+            for obj, obj_x, obj_y, _ in visible_objects:
+                if hasattr(obj, 'alive') and obj.alive and hasattr(obj, 'strength'):
+                    threat_found = True
+                    # Calculate distances
+                    current_dist = abs(self.x - obj_x) + abs(self.y - obj_y)
+                    new_dist = abs(target_x - obj_x) + abs(target_y - obj_y)
+                    # Strong reward for increasing distance from threats
+                    if new_dist > current_dist:
+                        score += 10
+                        # Add small bonus based on actual distance increase as tiebreaker
+                        score += (new_dist - current_dist) * 0.1
+                    elif new_dist < current_dist:
+                        score -= 15
+                    else:
+                        score -= 5
+            
+            # If fleeing but no threats visible, prefer to move away from center
+            # (assuming threats might be there)
+            if not threat_found:
+                center_x, center_y = board.width // 2, board.height // 2
+                current_center_dist = abs(self.x - center_x) + abs(self.y - center_y)
+                new_center_dist = abs(target_x - center_x) + abs(target_y - center_y)
+                if new_center_dist > current_center_dist:
+                    score += 3
+                        
+        elif self.state == "hungry" or self.energy < self.max_energy * 0.5:
+            # When hungry, move toward food
+            for obj, obj_x, obj_y, _ in visible_objects:
+                is_food = False
+                if isinstance(obj, Plant):
+                    is_food = True
+                elif hasattr(obj, 'alive') and not obj.alive:
+                    is_food = True
+                    
+                if is_food:
+                    current_dist = abs(self.x - obj_x) + abs(self.y - obj_y)
+                    new_dist = abs(target_x - obj_x) + abs(target_y - obj_y)
+                    # Reward moves that get closer to food
+                    if new_dist < current_dist:
+                        score += 8
+                    else:
+                        score -= 2
+        
+        return score
+    
+    def choose_move(self, board):
+        """
+        Choose the best move from available options.
+        This method can be overridden by subclasses for specialized behavior.
+        
+        Args:
+            board (Board): The game board
+            
+        Returns:
+            tuple: (x, y) coordinates of chosen move, or None if no good moves
+        """
+        possible_moves, visible_objects = self.get_movement_options(board)
+        
+        if not possible_moves:
+            return None
+            
+        # By default, choose the highest scoring move
+        best_move = possible_moves[0]
+        
+        # If the best move has a very negative score, consider not moving
+        if best_move[2] < -10:
+            return None
+            
+        return (best_move[0], best_move[1])
