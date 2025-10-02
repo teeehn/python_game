@@ -269,7 +269,7 @@ class Unit:
         # Unit should not move if energy is less than or equal to the cost,
         # meaning the move would leave it with 0 or negative energy.
         # The test `test_movement_mechanics` expects this behavior.
-        if self.energy < current_move_cost: # Modified from < to <=
+        if self.energy <= current_move_cost:
             return False
             
         # Check if movement is possible
@@ -530,14 +530,16 @@ class Unit:
             self.exploration_direction = self._get_next_exploration_direction()
             self.exploration_distance = 0
             
-        # Calculate the next position
-        next_x = self.x + self.exploration_direction[0]
-        next_y = self.y + self.exploration_direction[1]
+        # Return direction (delta), not position
+        dx, dy = self.exploration_direction[0], self.exploration_direction[1]
         
         # Check if the move is valid
-        if self.board.is_valid_position(next_x, next_y):
+        next_x = self.x + dx
+        next_y = self.y + dy
+        
+        if self.board.is_valid_position(next_x, next_y) and self.board.get_object(next_x, next_y) is None:
             self.exploration_distance += 1
-            return (next_x, next_y)
+            return (dx, dy)
             
         # If the move is invalid, try to find a valid alternative
         # Try perpendicular directions first
@@ -549,9 +551,167 @@ class Unit:
         for direction in perpendicular_directions:
             alt_x = self.x + direction[0]
             alt_y = self.y + direction[1]
-            if self.board.is_valid_position(alt_x, alt_y):
+            if self.board.is_valid_position(alt_x, alt_y) and self.board.get_object(alt_x, alt_y) is None:
                 self.exploration_direction = direction
                 self.exploration_distance = 0
-                return (alt_x, alt_y)
+                return direction
                 
         return None
+    
+    def get_movement_analysis(self, board) -> dict:
+        """
+        Analyze movement options using vision to detect objects and board edges.
+        
+        This centralized method provides:
+        - All possible moves from current position
+        - Objects visible within vision range
+        - Distance to board edges
+        - Basic scoring for each move
+        
+        Returns:
+            dict: Analysis containing:
+                - possible_moves: List of move options with scores
+                - visible_objects: List of objects in vision range
+                - board_edges: Distance to each edge
+        """
+        analysis = {
+            'possible_moves': [],
+            'visible_objects': [],
+            'board_edges': {
+                'north': self.y,
+                'south': board.height - 1 - self.y,
+                'east': board.width - 1 - self.x,
+                'west': self.x
+            }
+        }
+        
+        # Get visible objects using existing look method
+        visible_data = self.look(board)
+        for obj, x, y in visible_data:
+            distance = abs(x - self.x) + abs(y - self.y)
+            obj_type = 'unknown'
+            
+            if isinstance(obj, Plant):
+                obj_type = 'plant'
+            elif hasattr(obj, 'alive'):
+                if obj.alive:
+                    obj_type = 'unit'
+                else:
+                    obj_type = 'corpse'
+            
+            analysis['visible_objects'].append({
+                'object': obj,
+                'position': (x, y),
+                'distance': distance,
+                'type': obj_type
+            })
+        
+        # Analyze each possible move
+        movement_vectors = [(0, 1), (0, -1), (1, 0), (-1, 0)]  # Cardinal directions
+        
+        for dx, dy in movement_vectors:
+            new_x = self.x + dx
+            new_y = self.y + dy
+            
+            # Check if move is valid
+            if not board.is_valid_position(new_x, new_y):
+                continue
+                
+            if board.get_object(new_x, new_y) is not None:
+                continue
+                
+            # Calculate base score for this move
+            score = self._calculate_move_score(dx, dy, new_x, new_y, analysis)
+            
+            analysis['possible_moves'].append({
+                'position': (new_x, new_y),
+                'direction': (dx, dy),
+                'score': score
+            })
+        
+        return analysis
+    
+    def _calculate_move_score(self, dx, dy, new_x, new_y, analysis) -> float:
+        """
+        Calculate a score for a potential move.
+        
+        Default scoring considers:
+        - Exploration preference
+        - Edge avoidance
+        - Energy conservation
+        
+        Subclasses can override this for specialized behavior.
+        """
+        score = 50.0  # Base score
+        
+        # Prefer exploration direction
+        if hasattr(self, 'exploration_direction') and (dx, dy) == self.exploration_direction:
+            score += 20
+        
+        # Avoid edges (lower score near edges)
+        # Calculate distance to each specific edge
+        north_dist = new_y
+        south_dist = self.board.height - 1 - new_y
+        east_dist = self.board.width - 1 - new_x
+        west_dist = new_x
+        
+        min_edge_distance = min(north_dist, south_dist, east_dist, west_dist)
+        
+        # Penalty for being too close to edges
+        if min_edge_distance == 0:
+            score -= 30  # Heavy penalty for edge squares
+        elif min_edge_distance == 1:
+            score -= 15  # Moderate penalty for near-edge
+        elif min_edge_distance == 2:
+            score -= 5   # Light penalty
+            
+        # Additional penalty if move brings us closer to any edge
+        current_north = self.y
+        current_south = self.board.height - 1 - self.y
+        current_east = self.board.width - 1 - self.x
+        current_west = self.x
+        
+        # Check if we're moving toward an edge that's already close
+        moving_to_edge = False
+        if dy < 0 and north_dist == 0:  # Moving north to edge
+            moving_to_edge = True
+        elif dy > 0 and south_dist == 0:  # Moving south to edge
+            moving_to_edge = True
+        elif dx > 0 and east_dist == 0:  # Moving east to edge
+            moving_to_edge = True
+        elif dx < 0 and west_dist == 0:  # Moving west to edge
+            moving_to_edge = True
+            
+        if moving_to_edge:
+            score -= 20  # Heavy penalty for moving directly to edge
+        
+        # Consider energy level
+        energy_ratio = self.energy / self.max_energy
+        if energy_ratio < 0.3:
+            # Low energy - prefer moves that might lead to food
+            for obj_info in analysis['visible_objects']:
+                if obj_info['type'] in ['plant', 'corpse']:
+                    obj_x, obj_y = obj_info['position']
+                    # If move gets us closer to food, increase score
+                    current_dist = abs(obj_x - self.x) + abs(obj_y - self.y)
+                    new_dist = abs(obj_x - new_x) + abs(obj_y - new_y)
+                    if new_dist < current_dist:
+                        score += 15
+        
+        return max(0, score)  # Ensure non-negative score
+    
+    def select_best_move(self, analysis: dict) -> Optional[dict]:
+        """
+        Select the best move from the movement analysis.
+        
+        Args:
+            analysis: Movement analysis from get_movement_analysis
+            
+        Returns:
+            Best move option or None if no moves available
+        """
+        if not analysis['possible_moves']:
+            return None
+            
+        # Sort by score and return highest
+        return max(analysis['possible_moves'], key=lambda m: m['score'])
