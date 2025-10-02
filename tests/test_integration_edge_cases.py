@@ -91,8 +91,8 @@ def test_resource_competition(small_board):
     """Test multiple units competing for limited resources."""
     # Setup competing units
     units = [
-                Grazer(0, 0, config=None),
-                Grazer(2, 2, config=None)
+                Grazer(0, 0, config=None, board=small_board),
+                Grazer(2, 2, config=None, board=small_board)
     ]
     for unit in units: # Set energy lower so they will eat
         unit.energy = unit.max_energy // 2

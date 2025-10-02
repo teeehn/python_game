@@ -64,107 +64,110 @@ class Predator(Unit):
             self.state = "hunting"
             self._hunt_prey(board)
 
-    def _hunt_prey(self, board):
-        """Hunt for prey within vision range."""
-        visible_objects_data = self.look(board)
-
-        visible_units = []
-        for item in visible_objects_data:
-            obj = item[0]
-            if hasattr(obj, 'alive'):
-                visible_units.append(obj)
-
-        potential_prey = [u for u in visible_units if isinstance(u, (Grazer, Scavenger)) and u.alive]
+    def _calculate_move_score(self, dx, dy, new_x, new_y, analysis) -> float:
+        """Override base scoring to prioritize hunting behavior."""
+        # Start with base scoring
+        score = super()._calculate_move_score(dx, dy, new_x, new_y, analysis)
         
-        if potential_prey:
-            target = min(potential_prey, key=lambda u: ((u.x - self.x)**2 + (u.y - self.y)**2)**0.5)
-            dx = 0 if target.x == self.x else (1 if target.x > self.x else -1)
-            dy = 0 if target.y == self.y else (1 if target.y > self.y else -1)
-            
-            if abs(dx) + abs(dy) > self.speed:
-                if abs(target.x - self.x) > abs(target.y - self.y): dy = 0
-                else: dx = 0
-            
-            if abs(target.x - self.x) <= 1 and abs(target.y - self.y) <= 1:
-                energy_before_attack = self.energy
-                self.attack(target)
-                if self.energy < energy_before_attack:
-                    self.state = "combat"
-                    self.gain_experience("combat")
-                    if not target.alive:
-                        self.gain_experience("hunting")
-                        self.eat(target)
-            else:
-                moved = self.move(dx, dy, board)
-                if not moved and (dx != 0 or dy != 0):
-                    cardinal_dx = 0 if target.x == self.x else (1 if target.x > self.x else -1)
-                    cardinal_dy = 0 if target.y == self.y else (1 if target.y > self.y else -1)
-                    if cardinal_dx != 0 and self.move(cardinal_dx, 0, board):
-                        moved = True
-                    elif cardinal_dy != 0 and self.move(0, cardinal_dy, board):
-                        moved = True
-
-                if moved:
-                    self.energy -= self.energy_cost_move_hunt
-                    self.gain_experience("hunting", 0.5)
+        # Look for prey in visible objects
+        for obj_info in analysis['visible_objects']:
+            obj = obj_info['object']
+            if isinstance(obj, (Grazer, Scavenger)) and obj.alive:
+                obj_x, obj_y = obj_info['position']
+                current_dist = abs(obj_x - self.x) + abs(obj_y - self.y)
+                new_dist = abs(obj_x - new_x) + abs(obj_y - new_y)
+                
+                # Strong bonus for moves that get us closer to prey
+                if new_dist < current_dist:
+                    score += 40  # High priority for hunting
+                    if self.state == "hunting":
+                        score += 20  # Extra bonus when actively hunting
+        
+        # Look for threats (other predators)
+        for obj_info in analysis['visible_objects']:
+            obj = obj_info['object']
+            if isinstance(obj, Predator) and obj != self and obj.alive:
+                if obj.strength > self.strength:  # Stronger predator
+                    obj_x, obj_y = obj_info['position']
+                    current_dist = abs(obj_x - self.x) + abs(obj_y - self.y)
+                    new_dist = abs(obj_x - new_x) + abs(obj_y - new_y)
+                    
+                    # Penalty for moves closer to stronger predators
+                    if new_dist < current_dist:
+                        score -= 30
+                        if self.hp < self.max_hp * 0.5:
+                            score -= 20  # Extra penalty when wounded
+        
+        return max(0, score)
+    
+    def _hunt_prey(self, board):
+        """Hunt for prey within vision range using centralized movement."""
+        analysis = self.get_movement_analysis(board)
+        
+        # Check if any prey is adjacent for attack
+        for obj_info in analysis['visible_objects']:
+            obj = obj_info['object']
+            if isinstance(obj, (Grazer, Scavenger)) and obj.alive:
+                if obj_info['distance'] == 1:  # Adjacent
+                    energy_before_attack = self.energy
+                    self.attack(obj)
+                    if self.energy < energy_before_attack:
+                        self.state = "combat"
+                        self.gain_experience("combat")
+                        if not obj.alive:
+                            self.gain_experience("hunting")
+                            self.eat(obj)
+                    return
+        
+        # No adjacent prey, select best move
+        best_move = self.select_best_move(analysis)
+        if best_move:
+            dx, dy = best_move['direction']
+            if self.move(dx, dy, board):
+                self.energy -= self.energy_cost_move_hunt - self.energy_cost_move  # Adjust for hunt cost
+                self.gain_experience("hunting", 0.5)
+        else:
+            # No good moves, maybe explore
+            explore_move = self._get_exploration_move()
+            if explore_move:
+                dx, dy = explore_move
+                if self.move(dx, dy, board):
+                    self.energy -= self.energy_cost_move_hunt - self.energy_cost_move
 
     def _find_closest_food(self, board):
-        """Find and move toward the closest food source (typically dead units for Predator)."""
-        visible_objects_data = self.look(board)
-        food_sources = [item[0] for item in visible_objects_data if hasattr(item[0], 'alive') and not item[0].alive and hasattr(item[0], 'decay_stage') and item[0].decay_stage < 3]
-
-        if food_sources:
-            target = min(food_sources, key=lambda u: ((u.x - self.x)**2 + (u.y - self.y)**2)**0.5)
-            if abs(target.x - self.x) <= 1 and abs(target.y - self.y) <= 1:
-                self.eat(target)
-            else:
-                move_dx = 1 if target.x > self.x else (-1 if target.x < self.x else 0)
-                move_dy = 1 if target.y > self.y else (-1 if target.y < self.y else 0)
-                moved = self.move(move_dx, move_dy, board)
-                if not moved and (move_dx != 0 or move_dy != 0):
-                    if move_dx != 0 and self.move(move_dx, 0, board): moved = True
-                    elif move_dy != 0 and self.move(0, move_dy, board): moved = True
-
-                if moved:
-                    self.energy -= self.energy_cost_move
+        """Find and move toward the closest food source using centralized movement."""
+        analysis = self.get_movement_analysis(board)
+        
+        # Check if any food is adjacent
+        for obj_info in analysis['visible_objects']:
+            if obj_info['type'] == 'corpse' and obj_info['distance'] == 1:
+                obj = obj_info['object']
+                if hasattr(obj, 'decay_stage') and obj.decay_stage < 3:
+                    self.eat(obj)
+                    return
+        
+        # Use movement analysis to find best move toward food
+        best_move = self.select_best_move(analysis)
+        if best_move:
+            dx, dy = best_move['direction']
+            self.move(dx, dy, board)
         else:
-            # No dead units visible, perform an exploration move
-            explore_dx, explore_dy = self._get_exploration_move()
-            if explore_dx is not None and explore_dy is not None:
-                if self.move(explore_dx, explore_dy, board):
-                    self.energy -= self.energy_cost_move
+            # No good moves, explore
+            explore_move = self._get_exploration_move()
+            if explore_move:
+                dx, dy = explore_move
+                self.move(dx, dy, board)
 
     def _flee_from_threats(self, board):
-        """Predator flees from other (presumably stronger) Predators."""
-        visible_units = self.look(board)
-        threats = [item[0] for item in visible_units if isinstance(item[0], Predator) and item[0] != self and item[0].alive]
+        """Predator flees from stronger Predators using centralized movement."""
+        # The scoring system already handles fleeing, just select best move
+        analysis = self.get_movement_analysis(board)
+        best_move = self.select_best_move(analysis)
         
-        if threats:
-            threat = min(threats, key=lambda u: ((u.x - self.x)**2 + (u.y - self.y)**2)**0.5)
-            flee_dx = 0
-            if self.x < threat.x: flee_dx = -1
-            elif self.x > threat.x: flee_dx = 1
-            flee_dy = 0
-            if self.y < threat.y: flee_dy = -1
-            elif self.y > threat.y: flee_dy = 1
-            
-            if flee_dx == 0 and flee_dy == 0:
-                 flee_dx = random.choice([-1,1]) if board.is_valid_position(self.x-1, self.y) or board.is_valid_position(self.x+1, self.y) else 0
-                 flee_dy = random.choice([-1,1]) if board.is_valid_position(self.x, self.y-1) or board.is_valid_position(self.x, self.y+1) else 0
-                 if flee_dx == 0 and flee_dy == 0:
-                     available = board.get_available_moves(self.x, self.y)
-                     if available:
-                         panic_pos = random.choice(available)
-                         flee_dx = panic_pos.x - self.x
-                         flee_dy = panic_pos.y - self.y
-
-            moved = self.move(flee_dx, flee_dy, board)
-            if not moved and (flee_dx != 0 or flee_dy != 0):
-                if flee_dx != 0 and self.move(flee_dx, 0, board): moved = True
-                elif flee_dy != 0 and self.move(0, flee_dy, board): moved = True
-
-            if moved:
-                self.energy -= self.energy_cost_move_flee
+        if best_move:
+            dx, dy = best_move['direction']
+            if self.move(dx, dy, board):
+                self.energy -= self.energy_cost_move_flee - self.energy_cost_move
                 self.gain_experience("fleeing")
 
 class Scavenger(Unit):
@@ -183,6 +186,56 @@ class Scavenger(Unit):
             self.energy_cost_move_scavenge = self.energy_cost_move
         if not hasattr(self, 'energy_cost_move_flee') or self.energy_cost_move_flee is None:
             self.energy_cost_move_flee = self.energy_cost_move + 1
+            
+    def _calculate_move_score(self, dx, dy, new_x, new_y, analysis) -> float:
+        """Override base scoring to prioritize finding corpses and avoiding predators."""
+        # Start with base scoring
+        score = super()._calculate_move_score(dx, dy, new_x, new_y, analysis)
+        
+        # Look for corpses
+        for obj_info in analysis['visible_objects']:
+            if obj_info['type'] == 'corpse':
+                obj = obj_info['object']
+                if hasattr(obj, 'decay_stage') and obj.decay_stage < 4:
+                    obj_x, obj_y = obj_info['position']
+                    current_dist = abs(obj_x - self.x) + abs(obj_y - self.y)
+                    new_dist = abs(obj_x - new_x) + abs(obj_y - new_y)
+                    
+                    # Bonus for moves closer to corpses
+                    if new_dist < current_dist:
+                        score += 35
+                        if self.state == "scavenging":
+                            score += 15
+                        # Prioritize fresher corpses
+                        if obj.decay_stage < 2:
+                            score += 10
+        
+        # Avoid predators
+        for obj_info in analysis['visible_objects']:
+            obj = obj_info['object']
+            if isinstance(obj, Predator) and obj.alive:
+                obj_x, obj_y = obj_info['position']
+                current_dist = abs(obj_x - self.x) + abs(obj_y - self.y)
+                new_dist = abs(obj_x - new_x) + abs(obj_y - new_y)
+                
+                # Bonus for moves away from predators
+                if new_dist > current_dist:
+                    score += 30
+                elif new_dist < current_dist:
+                    score -= 40  # Penalty for moving toward predators
+        
+        # Also consider plants as backup food
+        if self.energy < self.max_energy * 0.3:
+            for obj_info in analysis['visible_objects']:
+                if obj_info['type'] == 'plant':
+                    obj_x, obj_y = obj_info['position']
+                    current_dist = abs(obj_x - self.x) + abs(obj_y - self.y)
+                    new_dist = abs(obj_x - new_x) + abs(obj_y - new_y)
+                    
+                    if new_dist < current_dist:
+                        score += 10  # Small bonus for backup food
+        
+        return max(0, score)
 
     def update(self, board):
         super().update(board)
@@ -199,99 +252,58 @@ class Scavenger(Unit):
             self._search_for_corpses(board)
 
     def _search_for_corpses(self, board):
-        """Search for dead units to consume."""
-        visible_objects_data = self.look(board)
-        corpses = [item[0] for item in visible_objects_data if hasattr(item[0], 'alive') and not item[0].alive and hasattr(item[0], 'decay_stage') and item[0].decay_stage < 4]
+        """Search for dead units to consume using centralized movement."""
+        analysis = self.get_movement_analysis(board)
         
-        if corpses:
-            target = min(corpses, key=lambda u: ((u.x - self.x)**2 + (u.y - self.y)**2)**0.5)
-            if abs(target.x - self.x) <= 1 and abs(target.y - self.y) <= 1:
-                self.eat(target)
-            else:
-                move_dx = 1 if target.x > self.x else (-1 if target.x < self.x else 0)
-                move_dy = 1 if target.y > self.y else (-1 if target.y < self.y else 0)
-                moved = self.move(move_dx, move_dy, board)
-                if not moved and (move_dx != 0 or move_dy != 0):
-                    if move_dx != 0:
-                        if self.move(move_dx, 0, board):
-                            moved = True
-                    if not moved and move_dy != 0:
-                        if self.move(0, move_dy, board):
-                            moved = True
-
-                if moved:
-                    self.energy -= self.energy_cost_move_scavenge
-                    self.gain_experience("hunting", 0.2)
+        # Check if any corpse is adjacent
+        for obj_info in analysis['visible_objects']:
+            if obj_info['type'] == 'corpse' and obj_info['distance'] == 1:
+                obj = obj_info['object']
+                if hasattr(obj, 'decay_stage') and obj.decay_stage < 4:
+                    self.eat(obj)
+                    return
+        
+        # Use movement analysis to find best move
+        best_move = self.select_best_move(analysis)
+        if best_move:
+            dx, dy = best_move['direction']
+            if self.move(dx, dy, board):
+                self.energy -= self.energy_cost_move_scavenge - self.energy_cost_move
+                self.gain_experience("hunting", 0.2)
 
     def _find_food(self, board):
-        """Find any food source when hungry."""
-        visible_objects_data = self.look(board)
-        food_sources = []
-        for item in visible_objects_data:
-            obj = item[0]
-            if (hasattr(obj, 'alive') and not obj.alive and hasattr(obj, 'decay_stage')) or isinstance(obj, Plant):
-                food_sources.append(obj)
+        """Find any food source when hungry using centralized movement."""
+        analysis = self.get_movement_analysis(board)
         
-        if food_sources:
-            target = min(food_sources, key=lambda u: ((u.x - self.x if hasattr(u, 'x') else u.position.x - self.x)**2 +
-                                                      (u.y - self.y if hasattr(u, 'y') else u.position.y - self.y)**2)**0.5)
-            target_x = target.x if hasattr(target, 'x') else target.position.x
-            target_y = target.y if hasattr(target, 'y') else target.position.y
-
-            if abs(target_x - self.x) <= 1 and abs(target_y - self.y) <= 1:
-                self.eat(target)
-            else:
-                move_dx = 1 if target_x > self.x else (-1 if target_x < self.x else 0)
-                move_dy = 1 if target_y > self.y else (-1 if target_y < self.y else 0)
-                moved = self.move(move_dx, move_dy, board)
-                if not moved and (move_dx != 0 or move_dy != 0):
-                    if move_dx != 0:
-                        if self.move(move_dx, 0, board):
-                            moved = True
-                    if not moved and move_dy != 0:
-                        if self.move(0, move_dy, board):
-                            moved = True
-
-                if moved:
-                    self.energy -= self.energy_cost_move_scavenge
-        else:
-            # No food sources visible, perform an exploration move
-            explore_dx, explore_dy = self._get_exploration_move()
-            if explore_dx is not None and explore_dy is not None:
-                if self.move(explore_dx, explore_dy, board):
-                    self.energy -= self.energy_cost_move_scavenge
+        # Check if any food is adjacent
+        for obj_info in analysis['visible_objects']:
+            if obj_info['distance'] == 1:
+                if obj_info['type'] == 'corpse':
+                    obj = obj_info['object']
+                    if hasattr(obj, 'decay_stage') and obj.decay_stage < 4:
+                        self.eat(obj)
+                        return
+                elif obj_info['type'] == 'plant':
+                    self.eat(obj_info['object'])
+                    return
+        
+        # Use movement analysis to find best move toward food
+        best_move = self.select_best_move(analysis)
+        if best_move:
+            dx, dy = best_move['direction']
+            if self.move(dx, dy, board):
+                self.energy -= self.energy_cost_move_scavenge - self.energy_cost_move
 
     def _flee_from_threats(self, board):
-        """Scavenger flees from Predators."""
-        visible_units = self.look(board)
-        threats = [item[0] for item in visible_units if isinstance(item[0], Predator) and item[0].alive]
+        """Scavenger flees from Predators using centralized movement."""
+        # The scoring system already handles fleeing
+        analysis = self.get_movement_analysis(board)
+        best_move = self.select_best_move(analysis)
         
-        if threats:
-            threat = min(threats, key=lambda u: ((u.x - self.x)**2 + (u.y - self.y)**2)**0.5)
-            flee_dx = 0
-            if self.x < threat.x: flee_dx = -1
-            elif self.x > threat.x: flee_dx = 1
-            flee_dy = 0
-            if self.y < threat.y: flee_dy = -1
-            elif self.y > threat.y: flee_dy = 1
-
-            if flee_dx == 0 and flee_dy == 0:
-                 flee_dx = random.choice([-1,1]) if board.is_valid_position(self.x-1, self.y) or board.is_valid_position(self.x+1, self.y) else 0
-                 flee_dy = random.choice([-1,1]) if board.is_valid_position(self.x, self.y-1) or board.is_valid_position(self.x, self.y+1) else 0
-                 if flee_dx == 0 and flee_dy == 0:
-                     available = board.get_available_moves(self.x, self.y)
-                     if available:
-                         panic_pos = random.choice(available)
-                         flee_dx = panic_pos.x - self.x
-                         flee_dy = panic_pos.y - self.y
-
-            moved = self.move(flee_dx, flee_dy, board)
-            if not moved and (flee_dx != 0 or flee_dy != 0):
-                if flee_dx != 0 and self.move(flee_dx, 0, board): moved = True
-                elif flee_dy != 0 and self.move(0, flee_dy, board): moved = True
-            
-            if moved:
-                self.energy -= self.energy_cost_move_flee
+        if best_move:
+            dx, dy = best_move['direction']
+            if self.move(dx, dy, board):
+                self.energy -= self.energy_cost_move_flee - self.energy_cost_move
                 self.gain_experience("fleeing")
 
 class Grazer(Unit):
@@ -310,6 +322,42 @@ class Grazer(Unit):
             self.energy_cost_move_graze = self.energy_cost_move
         if not hasattr(self, 'energy_cost_move_flee') or self.energy_cost_move_flee is None:
             self.energy_cost_move_flee = self.energy_cost_move + 1 # Default flee cost
+            
+    def _calculate_move_score(self, dx, dy, new_x, new_y, analysis) -> float:
+        """Override base scoring to prioritize fleeing from predators and finding plants."""
+        # Start with base scoring
+        score = super()._calculate_move_score(dx, dy, new_x, new_y, analysis)
+        
+        # Strong fleeing behavior from predators
+        for obj_info in analysis['visible_objects']:
+            obj = obj_info['object']
+            if isinstance(obj, Predator) and obj.alive:
+                obj_x, obj_y = obj_info['position']
+                current_dist = abs(obj_x - self.x) + abs(obj_y - self.y)
+                new_dist = abs(obj_x - new_x) + abs(obj_y - new_y)
+                
+                # Strong bonus for moves that increase distance from predators
+                if new_dist > current_dist:
+                    score += 50  # High priority for fleeing
+                    if self.state == "fleeing":
+                        score += 30  # Extra bonus when actively fleeing
+                elif new_dist < current_dist:
+                    score -= 60  # Heavy penalty for moving toward predators
+        
+        # Look for plants to eat
+        for obj_info in analysis['visible_objects']:
+            if obj_info['type'] == 'plant':
+                obj_x, obj_y = obj_info['position']
+                current_dist = abs(obj_x - self.x) + abs(obj_y - self.y)
+                new_dist = abs(obj_x - new_x) + abs(obj_y - new_y)
+                
+                # Bonus for moves closer to plants
+                if new_dist < current_dist:
+                    score += 25
+                    if self.energy < self.max_energy * 0.5:
+                        score += 15  # Extra bonus when hungry
+        
+        return max(0, score)
             
     def update(self, board):
         super().update(board)
@@ -330,94 +378,41 @@ class Grazer(Unit):
             self._graze(board)
 
     def _graze(self, board):
-        """Wander to find and consume plants."""
-        visible_plants_data = self.look(board)
-        plants = [item[0] for item in visible_plants_data if isinstance(item[0], Plant)]
-
-        if plants:
-            target = min(plants, key=lambda p: ((p.position.x - self.x)**2 + (p.position.y - self.y)**2)**0.5)
-            if abs(target.position.x - self.x) <= 1 and abs(target.position.y - self.y) <= 1:
-                if self.eat(target):
+        """Wander to find and consume plants using centralized movement."""
+        analysis = self.get_movement_analysis(board)
+        
+        # Check if any plant is adjacent
+        for obj_info in analysis['visible_objects']:
+            if obj_info['type'] == 'plant' and obj_info['distance'] == 1:
+                plant = obj_info['object']
+                if self.eat(plant):
                     self.gain_experience("feeding")
-            else:
-                move_dx = 1 if target.position.x > self.x else (-1 if target.position.x < self.x else 0)
-                move_dy = 1 if target.position.y > self.y else (-1 if target.position.y < self.y else 0)
-                moved = self.move(move_dx, move_dy, board)
-                if not moved and (move_dx != 0 or move_dy != 0):
-                    if move_dx != 0 and self.move(move_dx, 0, board):
-                        moved = True
-                    elif move_dy != 0 and self.move(0, move_dy, board):
-                        moved = True
-                if moved:
-                    self.energy -= self.energy_cost_move_graze
-                    self.gain_experience("feeding", 0.2)
-        else:
-            explore_dx, explore_dy = self._get_exploration_move()
-            if explore_dx is not None and explore_dy is not None:
-                if self.move(explore_dx, explore_dy, board):
-                    self.energy -= self.energy_cost_move_graze
+                    return
+        
+        # Use movement analysis to find best move
+        best_move = self.select_best_move(analysis)
+        if best_move:
+            dx, dy = best_move['direction']
+            if self.move(dx, dy, board):
+                self.energy -= self.energy_cost_move_graze - self.energy_cost_move
+                self.gain_experience("feeding", 0.2)
 
     def _find_food(self, board):
-        """Find closest plant when hungry."""
-        visible_plants_data = self.look(board)
-        plants = [item[0] for item in visible_plants_data if isinstance(item[0], Plant)]
+        """Find closest plant when hungry using centralized movement."""
+        # Same as _graze but with urgency
+        self._graze(board)
+
+    def _flee_from_threats(self, board, threats):
+        """Move away from predators using centralized movement."""
+        # The scoring system already handles fleeing
+        analysis = self.get_movement_analysis(board)
+        best_move = self.select_best_move(analysis)
         
-        if plants:
-            target = min(plants, key=lambda p: ((p.position.x - self.x)**2 + (p.position.y - self.y)**2)**0.5)
-            if abs(target.position.x - self.x) <= 1 and abs(target.position.y - self.y) <= 1:
-                if self.eat(target):
-                    self.gain_experience("feeding")
-            else:
-                move_dx = 1 if target.position.x > self.x else (-1 if target.position.x < self.x else 0)
-                move_dy = 1 if target.position.y > self.y else (-1 if target.position.y < self.y else 0)
-                moved = self.move(move_dx, move_dy, board)
-                if not moved and (move_dx != 0 or move_dy != 0):
-                    if move_dx != 0 and self.move(move_dx, 0, board):
-                        moved = True
-                    elif move_dy != 0 and self.move(0, move_dy, board):
-                        moved = True
-
-                if moved:
-                    self.energy -= self.energy_cost_move_graze
-        else:
-            # No plants visible, perform an exploration move
-            explore_dx, explore_dy = self._get_exploration_move()
-            if explore_dx is not None and explore_dy is not None:
-                if self.move(explore_dx, explore_dy, board):
-                    self.energy -= self.energy_cost_move_graze
-
-    def _flee_from_threats(self, board, threats): # Accept threats to avoid re-calculating
-        """Move away from predators."""
-        if threats: # threats is now passed in
-            threat = min(threats, key=lambda u: ((u.x - self.x)**2 + (u.y - self.y)**2)**0.5)
-            flee_dx = 0
-            if self.x < threat.x: flee_dx = -1
-            elif self.x > threat.x: flee_dx = 1
-            flee_dy = 0
-            if self.y < threat.y: flee_dy = -1
-            elif self.y > threat.y: flee_dy = 1
-            
-            if flee_dx == 0 and flee_dy == 0: # Fallback if on same spot or calculation error
-                 flee_dx = random.choice([-1,1]) if board.is_valid_position(self.x-1, self.y) or board.is_valid_position(self.x+1, self.y) else 0
-                 flee_dy = random.choice([-1,1]) if board.is_valid_position(self.x, self.y-1) or board.is_valid_position(self.x, self.y+1) else 0
-                 if flee_dx == 0 and flee_dy == 0:
-                     available = board.get_available_moves(self.x, self.y)
-                     if available:
-                         panic_pos = random.choice(available)
-                         flee_dx = panic_pos.x - self.x
-                         flee_dy = panic_pos.y - self.y
-            
-            moved = self.move(flee_dx, flee_dy, board)
-            if not moved and (flee_dx != 0 or flee_dy != 0):
-                if flee_dx != 0 and self.move(flee_dx, 0, board):
-                    moved = True
-                elif flee_dy != 0 and self.move(0, flee_dy, board): # Use elif to avoid second move if first cardinal succeeded
-                    moved = True
-            
-            if moved:
-                self.energy -= self.energy_cost_move_flee
+        if best_move:
+            dx, dy = best_move['direction']
+            if self.move(dx, dy, board):
+                self.energy -= self.energy_cost_move_flee - self.energy_cost_move
                 self.gain_experience("fleeing")
-                pass
 
 # Dictionary mapping unit type names to their classes
 UNIT_TYPES = {
